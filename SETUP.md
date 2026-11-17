@@ -51,9 +51,10 @@ guest_exec = ["docker", "--context", "colima-cayo", "exec", "-i", "cayo-{profile
 guest_exec = ["docker", "--context", "colima-cayo", "exec", "-i", "cayo-{profile}-{name}"]
 ```
 
-`--context` selects cayo's VM explicitly, since the broker runs with a fixed environment and the
-machine's default Docker context is not cayo's. The relay runs as the guest's user, `cayo`, and
-listens in its home volume (DESIGN.md §3).
+`--context` selects cayo's VM explicitly, since the machine's default Docker context is not
+cayo's, and the broker starts `guest_exec` with its fixed environment (SPEC.md §8), so a
+`DOCKER_CONTEXT` exported in your shell wouldn't reach it either. The relay runs as the guest's
+user, `cayo`, and listens in its home volume (DESIGN.md §3).
 
 ## 4. The approval pane
 
@@ -143,6 +144,12 @@ SPEC.md §8. The repository will carry complete, tested examples under `examples
 copy into `~/.penyero/resources/` and adapt; the two below are for the resources in
 SPEC.md's example configuration.
 
+**These two are sketches, not yet safe to use.** They show the shape; they get written properly,
+in Python with real argument parsing (SPEC.md §8), and tested, in the core-loop iteration
+(DESIGN.md §11). A known hole in the first: it refuses `--endpoint-url`, but the AWS CLI accepts
+abbreviated options (checked on 2.27: `--endpoint` works), so the request can be sent, signed,
+to a host the agent names. Its options need an allow-list, like its operations.
+
 ```sh
 #!/bin/sh
 # ~/.penyero/resources/aws-readonly
@@ -165,13 +172,19 @@ AWS_SHARED_CREDENTIALS_FILE="$HOME/.penyero/aws/readonly.credentials" \
 
 ```sh
 #!/bin/sh
-# ~/.penyero/resources/prod-db-ro
-# `sqlquery` is the human's driver-based script: one SQL statement in on stdin, sent with the
-# extended query protocol (which refuses a second one, so a SET can't lift the timeout), CSV
-# out, and the driver's own errors on stderr, for the human.
-PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
-  exec "$HOME/.penyero/bin/sqlquery" \
-  "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
+# ~/.penyero/resources/pg <credential>
+# One executable for every Postgres resource: the configuration names the credential in `run`
+# (["~/.penyero/resources/pg", "prod-ro"]); the agent can't, since these resources take no
+# arguments. `sqlquery` is the human's driver-based script: one SQL statement in on stdin, sent
+# with the extended query protocol (which refuses a second one, so a SET can't lift the
+# timeout), CSV out, and the driver's own errors on stderr, for the human.
+case $1 in
+  prod-ro) conninfo="host=... user=app_ro dbname=... options='-c statement_timeout=60s'" ;;
+  prod-rw) conninfo="host=... user=app_rw dbname=... options='-c statement_timeout=60s'" ;;
+  *) echo "pg: unknown credential $1" >&2; exit 1 ;;
+esac
+PGPASSWORD="$(security find-generic-password -s "penyero-pg-$1" -w)" \
+  exec "$HOME/.penyero/bin/sqlquery" "$conninfo"
 ```
 
 - `sqlquery` is a single-file Python script run by uv, with its database driver pinned inline
@@ -212,7 +225,7 @@ auto-approved and released unreviewed in `trusted`. The token still enters the g
 # ~/.local/bin/git-credential-penyero, in the guest: git config credential.helper penyero
 [ "$1" = get ] || exit 0
 id=$(penyero request git-token -r "git credential for a fetch" </dev/null) &&
-  penyero wait "$id" && exec penyero retrieve "$id"
+  penyero wait "$id" >/dev/null && exec penyero retrieve "$id"
 ```
 
 ## 8. Other setups

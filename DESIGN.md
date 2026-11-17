@@ -69,11 +69,25 @@ Queues are views over state, not separate structures:
   knows each open `wait` and the ids it lists, since it answers them when they settle.
 - **Outbox.** Requests in a terminal state.
 
+The prompt is one module: it reads the state and the terminal and emits decisions, and nothing
+else in the broker draws or reads keys, so another front end (SPEC.md §10) replaces only it.
+
 Only the active prompt reads the terminal. Input that arrives before a prompt is drawn is
-flushed (`termios.tcflush`); a prompt whose request is cancelled or dropped is withdrawn with an
-entry, and a key in flight either lands on the withdrawn request, where it does nothing, or is
-flushed; entries for other requests are printed between prompts, or held while the human types a
-message (SPEC.md §7).
+flushed (`termios.tcflush`). A prompt whose request is cancelled or dropped is redrawn as
+withdrawn and waits for Enter; until then decision keys do nothing, and the next prompt is drawn,
+after a flush, only once the human continues. Entries for other requests are printed between
+prompts, or held while the human types a message (SPEC.md §7).
+
+All text from the guest or a resource goes through one function before it reaches the terminal:
+bytes are decoded as UTF-8, undecodable ones shown as `\xNN`, and every character for which
+`str.isprintable()` is false (apart from the newline that ends a line) as `\xNN` or `\uNNNN`. The
+same function counts a request's non-ASCII characters for its flag.
+
+**No write blocks the loop.** The channel pipe and every resource's stdin are non-blocking and
+written when the selector says they are writable, from bounded buffers: a result is read from its
+spool one chunk at a time as the channel drains, a payload likewise into the resource. A guest
+that stops reading its channel, or a resource that doesn't read its input, stalls only its own
+transfer; the prompt and the other requests carry on.
 
 The review pager and editor take over the terminal, but the loop keeps running underneath them:
 the tool runs as a child, the loop keeps answering heartbeats and clients, and pane output is
@@ -82,18 +96,21 @@ lapse.
 
 Resources run as child processes of the broker, in their own session without a controlling
 terminal, with stdin, stdout and stderr connected to the request, and with the fixed environment
-of SPEC.md §8 (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`, `PENYERO_P_*`) built from scratch rather
-than filtered. They can't prompt on, or write to, the approval pane. The broker collects stdout as
-the result and stderr for the pane and the log (SPEC.md §8, the resource contract), both spooled
-(§5), so the running view (SPEC.md §7) can show a snapshot of either at any time.
+of SPEC.md §8 (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`) built from scratch rather than filtered; the
+channel process, the review tools and a `notify` command get the same one. Their argv is the
+resource's `run` list followed by the request's arguments. They can't prompt on, or write to, the
+approval pane. The broker collects stdout as the result and stderr for the pane and the log
+(SPEC.md §8, the resource contract), both spooled (§5), so the running view (SPEC.md §7) can show
+a snapshot of either at any time; the time of the last read from either is kept for that view.
 
 ## 2. Configuration resolution
 
 At start, `serve <profile> <name>`:
 
 1. Loads `config.toml` (SPEC.md §8) after checking ownership and permissions.
-2. Substitutes `{profile}` and `{name}` in the profile's `guest_exec`. `name` must match
-   `[A-Za-z0-9][A-Za-z0-9._-]*`, so it cannot alter the command's shape.
+2. Substitutes `{profile}` and `{name}` in the profile's `guest_exec`, which must contain both
+   (SPEC.md §8). `name` must match `[A-Za-z0-9][A-Za-z0-9._-]*`, so it cannot alter the command's
+   shape.
 3. Builds the guest's resource table from the profile's `resources` table: each entry's resource
    definition plus that entry's `confirm_request`/`confirm_output` (default `true`). An entry for
    an undefined resource, or `confirm_request = false` on a resource with `write_credential`, is
@@ -179,8 +196,10 @@ of one guest share a run id with a chance around 5 × 10⁻⁴ over a thousand r
 id is reported as unknown (252) instead of lost. Both sizes get tuned during development (§12).
 Random rather than sequential, an id tells an agent nothing about other sessions' requests, and a
 mistyped or stale id practically never lands on someone else's. The prompt shows only the request
-part. `wait` or `retrieve` for an id from an earlier run answers 248 (lost), with the audit log's
-last recorded step for that request on stderr.
+part. `wait` or `retrieve` for a request an earlier run left unretrieved answers 248 (lost), with
+its last recorded step on stderr. The broker reads its log once, at start, and keeps those
+requests' ids and last steps in memory: a guest's ids are never looked up in a file, so a guest
+can't make the loop scan one.
 
 A settled request keeps its result until a `retrieve` completes: the client sends `retrieved` after
 writing the last byte to its stdout without error, and only then does the broker delete the request
@@ -190,7 +209,7 @@ writing the last byte to its stdout without error, and only then does the broker
 with `tempfile.SpooledTemporaryFile`: in memory up to a threshold (1 MiB), then rolled over to a
 file in the broker's private temp directory (§8). A rolled-over spool file has no path, so the
 prompt's head/tail preview (10 lines each; a request is shown whole up to 20 lines, §12) reads the
-spool, and `view` and `edit` first write a named copy, with the extension from `output_syntax`, into
+spool, and `view` and `edit` first write a named copy, with the extension from `output_ext`, into
 the same directory. An edited copy becomes the released result. Output stops at a per-request cap
 (default 64 MiB): the resource is stopped and the request becomes `failed` with the output written
 up to the cap. `retrieve` exits 1, and a `penyero:` line on stderr says the cap was reached, the
@@ -211,9 +230,9 @@ is logged.
 
 - **Client ↔ relay:** newline-delimited JSON, one command per connection. The client sends one
   message (`list`, `describe`, `request`, `wait`, `retrieve`, `pending`, `cancel`) and reads
-  events until the connection closes: `accepted` (with the id), `settled`, `chunk`, `result`,
-  `error`. For `retrieve` the client answers the final `result` with `retrieved` once its stdout
-  is written.
+  events until the connection closes: `accepted` (with the id), `settled` (with the outcome
+  `wait` prints), `chunk`, `result`, `error`. For `retrieve` the client answers the final
+  `result` with `retrieved` once its stdout is written.
 - **Relay ↔ broker:** the same messages over the channel, each line wrapped with a connection id
   assigned by the relay: `{"conn": 7, "msg": {...}}`, plus `{"conn": 7, "close": true}`. This
   multiplexes concurrent clients over one channel. The relay does not interpret messages; it only
@@ -245,7 +264,9 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 - Everything lives under `~/.penyero` on the privileged side (SPEC.md §8), with no override
   through the environment; tests set `HOME`.
 - Audit log: `~/.penyero/log/<profile>/<name>.jsonl`, one JSON line per request step,
-  each carrying the request id (SPEC.md §9). A directory per profile keeps names apart without
+  each carrying the request id (SPEC.md §9), written with the encoder's default of escaping
+  everything outside ASCII; a request that isn't valid UTF-8 is logged as base64. Of a resource's
+  stderr the last 64 KiB are logged. A directory per profile keeps names apart without
   restricting them: `a/b-c` and `a-b/c` would collide in a single flat name. `profile/name` is
   unique only while the guest exists
   (the runtime enforces it: container names, VM names, user names), and a guest recreated with the
@@ -257,6 +278,8 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 
 ## 9. Technology
 
+- The client's command line is parsed with `argparse`, whose own exit status for a malformed one
+  (2) is replaced by 253 (SPEC.md §6).
 - **Language: Python**, with a **pinned interpreter managed by uv**, so there is no dependency on
   the stock system Python and no version matrix to support. A self-contained executable that needs
   nothing installed (pex's scie output or PyInstaller embed the interpreter) is a packaging option

@@ -222,22 +222,30 @@ public tracker in `public`.
   finds in its own files. Secrets must not be placed in the guest.
 - **Known issue: the agent's own credential.** Every guest that runs an agent holds the agent's
   login or API key, including profiles that otherwise hold nothing. Use a dedicated key with a
-  spending limit for untrusted profiles.
+  spending limit for untrusted profiles. In every profile, a login to an account carries whatever
+  else that account has: hosted connectors (§5) reach the agent with it, unmediated.
 - An egress allow-list narrows C but doesn't close it. Any allowed host that stores data for
   whoever authenticates (a model provider's API with an attacker's key, a package registry, a code
   host) can carry data out. That is why `public` reviews every output rather than relying on its
   allow-list.
 - Network services the guest can reach: dev services (which hold dev data only, and must have no
-  route out of their own, since the guest can often run code in them) and, depending on the
-  deployment, services listening on the host (see SETUP.md and the deployment's own
-  documentation).
+  route out of their own, since the guest can often run code in them) and, in deployments that
+  don't block it, services listening on the host. The reference deployment blocks it (SETUP.md
+  §1); a guest that is a separate OS user reaches the host's loopback like any local process.
+- **What a request tells the agent before its output is reviewed.** `confirm_output` reviews
+  content. Whether a request succeeded, failed without output, or is still running, and how long
+  it took, reach the agent unreviewed. With `confirm_request = false` an agent can turn that into
+  a slow channel (a query that fails or not depending on a value) with no approval in its way,
+  though each probe shows in the pane.
 - Escape from the guest through a runtime or kernel vulnerability. The strength of this boundary
   is a deployment choice. One class deserves naming, because penyero triggers it: running a
   program inside a hostile guest (contract item 2) is what container-escape flaws such as
   CVE-2019-5736 in runc exploited. Keep the runtime patched, and prefer runtimes that put a VM
   around each guest (SETUP.md §1 and §8).
 - The human being misled by what the agent shows them. Mitigated by rendering request and output
-  content safely (§7), by keeping approvals specific, and later by checkers (§10).
+  content safely (§7), by keeping approvals specific, and later by checkers (§10). Look-alike
+  letters from another script (a Cyrillic `а` in a table name) can't be escaped away; a request
+  that holds any non-ASCII character is flagged (§7), and the rest is the reviewer's eye.
 
 ## 4. Deployment contract
 
@@ -313,14 +321,16 @@ a request is submitted, waited for, and retrieved, in three separate commands. E
 one thing, so any of them can be composed with other tools without ambiguity.
 
 - `penyero list`: the resources this guest may request.
-- `penyero describe <resource>`: its description, what input it takes, its declared parameters,
-  and whether it is auto-approved for this guest.
-- `penyero request <resource> -r <reason> [-p key=value]... [-- args...] [< payload]`: submit a
-  request. Prints the request id on stdout and exits at once.
+- `penyero describe <resource>`: its description, what input it takes, and whether it is
+  auto-approved for this guest. (An agent would learn that from its first request anyway; told,
+  it can say which requests need the human.)
+- `penyero request <resource> -r <reason> [-- args...] [< payload]`: submit a request. Prints
+  the request id on stdout and exits at once.
 - `penyero wait <id>... [--timeout <seconds>]`: block until every listed request is settled (its
-  result is ready, it failed, was denied, or was dropped). Prints nothing on stdout. Without
-  `--timeout` it waits indefinitely. It exits 0 once all are settled; `retrieve` then tells each
-  outcome.
+  result is ready, it failed, was denied, or was dropped). Without `--timeout` it waits
+  indefinitely. Once all are settled it exits 0 and prints one line per request, in the order
+  given: `<id> ready`, `<id> failed`, `<id> denied` or `<id> dropped`, which is what `retrieve`
+  will answer (0, 1, 251, 249). So the agent knows each outcome before it pipes a result anywhere.
 - `penyero retrieve <id>`: write the result to stdout. Never blocks: if the request is not
   settled, it exits with a distinct status.
 - `penyero pending`: this guest's requests not yet retrieved, with resource and state.
@@ -341,8 +351,8 @@ penyero wait "$a" "$b" && penyero retrieve "$a" | jq ... && penyero retrieve "$b
 ```
 
 - `-r <reason>` is required. It is shown to the human and written to the audit log.
-- Inputs travel **by value**: the payload on stdin, extra arguments after `--`, named parameters as
-  `-p key=value`, each only if the resource declares it (§8). A file the agent wants to use (a
+- Inputs travel **by value**: the payload on stdin and extra arguments after `--`, each only if
+  the resource declares it (§8). A file the agent wants to use (a
   `.sql` file or a Python script) is read by the *client* and sent as content. The broker never
   opens workspace paths, and never writes into them: the agent redirects `retrieve`'s stdout where
   it wants it.
@@ -361,11 +371,11 @@ penyero wait "$a" "$b" && penyero retrieve "$a" | jq ... && penyero retrieve "$b
   the client wrote the last byte to its stdout without error and reported that to the broker; a
   broken pipe leaves the result in place for another `retrieve`. An agent that needs a result
   again keeps its own copy.
-- If the human edited the request, `retrieve` says so on stderr, followed by the version that ran,
-  so the agent does not reason from a query it did not actually get answered. If the human
-  changed the output (redacted it, or wrote an answer into it), it says so on stderr, so the agent
-  does not take withheld data for absent data. stdout carries only the result. The original
-  request and the original output are never sent; they exist only in the audit log.
+- A request runs exactly as submitted, or not at all: the human approves or denies it, and a
+  denial's message says what to change. If the human changed the output (redacted it, or wrote an
+  answer into it), `retrieve` says so on stderr, always, so the agent does not take withheld data
+  for absent data. stdout carries only the result. The original output is never sent, and is
+  kept nowhere (§9).
 
 **Exit status.** Resource executables never talk to the agent through exit codes (§8), so the
 client's own codes cannot collide with theirs:
@@ -379,11 +389,14 @@ client's own codes cannot collide with theirs:
 | 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` | Wait again |
 | 251 | Denied by the human: the request, the release of its output, or the request while it ran (killed, §7), with their message on stderr | `retrieve` | Not repeat it as is; if it was killed while running, check its effects |
 | 252 | Unknown id: never existed, already retrieved, or cancelled by the agent | `wait`, `retrieve`, `cancel` | Nothing to fetch |
-| 253 | Invalid request: unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that has started | `request`, `describe`, `cancel` | Fix the call, or retrieve or cancel outstanding requests |
+| 253 | Invalid request: a malformed command line, unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that has started | all | Fix the call, or retrieve or cancel outstanding requests |
 | 254 | Broker not connected | all | Retry once it is back |
 
-Codes 248–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
-with a one-line `penyero: ...` message on stderr.
+Codes 248–254 stay clear of what a shell reports around a command: 2 for misuse, 126 and 127 for
+a command that can't run or isn't found, 128 plus the signal number for one that was killed, and
+255, the highest status there is, which ssh among others uses for its own failures. So a status
+in this range always comes from penyero. Every non-zero exit comes with a one-line
+`penyero: ...` message on stderr.
 
 **When the broker connection is lost** (guest restarted, broker stopped):
 
@@ -400,16 +413,20 @@ with a one-line `penyero: ...` message on stderr.
 ## 7. Approval
 
 Each guest has its own approval prompt, on the terminal where the human runs
-`penyero serve <profile> <name>`. The prompt is line-oriented, like `git add -p`. Layouts and
-wording in this section are examples; the behaviour is what is specified.
+`penyero serve <profile> <name>`. What is specified is the interaction: which requests wait for
+the human, in what order, what is shown and which decisions exist. It doesn't depend on how the
+pane is drawn. The first front end is line-oriented, like `git add -p`: the cheapest to build, and
+one that tests can drive through a pipe. Review has to be comfortable, because a cumbersome one
+gets approved unread, so a full-screen front end may replace it once the core is in use (§10).
+Layouts and wording in this section are examples of the line-oriented one.
 
 ```
 [3mxp9dq2vt] trusted/shop · prod-db-ro               running: aws-readonly 1 · waiting: 1 run
      reason: count overdue orders by region
      SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
-run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [r]unning [?]
+run? [y]es [Y]es+release [n]o(+msg) [s]kip [v]iew [r]unning [?]
   · [k7f2qa01ab] aws-readonly · exit 0 · 12 lines · released (auto)
-[3mxp9dq2vt] run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [r]unning [?]
+[3mxp9dq2vt] run? [y]es [Y]es+release [n]o(+msg) [s]kip [v]iew [r]unning [?]
 ...
 [3mxp9dq2vt] trusted/shop · prod-db-ro · exit 0 · 214 lines · 6.1 KB · 1.4 s   waiting: 1 run
      reason: count overdue orders by region
@@ -432,42 +449,62 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
   first, since that result is what unblocks an agent; the rest follow in arrival order. `s` moves
   a prompt to the back of its kind. This order needs no knowledge of which agent sent what, and
   it can only reorder the guest's own prompts, never change what is shown or decided.
-- **A request is seen in full before it is approved.** Its payload, arguments and parameters
-  are shown whole when they fit the preview. When they don't, `y` and `Y` are refused until the
-  request has been opened with `v` or `e`: a line buried in the middle of a long request is
-  exactly what a hostile agent would hide. Outputs need no full view before release; `v` shows
-  them whole.
-- **A prompt never changes under the human.** The active prompt ends with their input, or is
-  withdrawn with an entry saying why when its request is cancelled by the agent or dropped with
-  the channel; a withdrawal can only remove a request, never put another in its place. Keys
-  typed before a prompt is drawn are discarded, so each key answers a prompt that was on screen.
+- **A request is seen in full before it is approved.** Its payload and arguments are shown whole
+  when they fit the preview. When they don't, `y` and `Y` are refused until the request has been
+  opened with `v`: a line buried in the middle of a long request is exactly what a hostile agent
+  would hide. Outputs need no full view before release; `v` shows them whole. Whatever the front
+  end, content is wrapped, never clipped at the pane's edge, and anything left out is marked as
+  left out.
+- **A request is approved or denied, not edited.** The agent's request runs as written; `n` with
+  a message ("add a LIMIT") costs the agent seconds and leaves it knowing what ran. Only outputs
+  are edited (below).
+- **A prompt never changes under the human.** The active prompt ends with their input. When its
+  request is cancelled by the agent or dropped with the channel, the prompt stays on screen,
+  marked withdrawn with the reason, still viewable with `v`, and the next one is drawn only after
+  the human continues with a key that decides nothing (Enter). Otherwise the agent, which chooses
+  when to cancel, would choose the moment another request appears under a key meant for this
+  one. A request withdrawn while it waits behind the active prompt just gets an entry. Keys typed
+  before a prompt is drawn are discarded, so each key answers a prompt that was on screen. In a
+  front end that lists requests, a decision applies to the request in focus, and the focus never
+  moves by itself.
 - **Everything that runs is shown.** Requests that need no confirmation, results released
   without review, failures and channel events each get a one-line entry. One that arrives while a
   prompt waits is printed, and the prompt line repeated with its request id; while the human
   types a message or works in the pager or editor, entries are held until they finish.
 - **Each prompt header carries the state**: requests running per resource, and prompts waiting
-  of each kind. A write approved while another on the same resource still runs is visible as
+  of each kind. A resource with `write_credential` (§8) is marked as a write, so a write never
+  looks like a read, and one approved while another on the same resource still runs is visible as
   such.
 - **Release prompts repeat their context**: reason and request above the output, since a result
   can arrive long after its approval.
 - The resource's stderr (§8) is never sent to the guest. Its tail is shown with the request's
-  release prompt or completion entry, and all of it through `view`, the running view (below) and
-  the audit log.
-- Notification is configurable per profile (`notify`, §8): a terminal bell, a command, or
-  nothing. It fires when the pane goes from idle to having a prompt, not for each queued one.
-- **All agent-supplied text is rendered with control characters escaped.** Requests and outputs
-  must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
-  terminal.
+  release prompt or completion entry, and all of it through `view` and the running view (below)
+  while the request exists; the audit log keeps its tail (§9).
+- Notification is configurable (`notify`, §8): a terminal bell, a command, or nothing. It fires
+  when the pane goes from idle to having a prompt, not for each queued one.
+- **Everything that didn't come from the configuration is rendered escaped**: requests, reasons,
+  outputs, a resource's stderr, the channel's stderr. Escaped means every character that is not
+  printable is shown as its code (`\x1b`, `‮`), and so is every byte that isn't valid UTF-8.
+  That covers more than the control characters that move the cursor, hide lines, restyle the
+  prompt or query the terminal: Unicode's format characters are invisible and reorder or join
+  what is displayed (a right-to-left override makes a query read differently from what runs), so
+  they are escaped too. The test is the standard library's (`str.isprintable`), not a list kept
+  here. It holds for outputs as for requests: a stored value an attacker wrote must not disguise
+  what is being released.
+- **A request with non-ASCII characters is flagged**, with their count, in its prompt. Printable
+  letters of other scripts can pass for Latin ones, and no escaping tells them apart; in SQL or a
+  command line they are rare enough for a flag to mean something. Outputs are not flagged:
+  names and text in them are ordinary.
 - The inline prompt shows the content as it is, escaped, never reformatted: a view rebuilt from
   parsed content can differ from what is approved (a JSON object with a duplicate key shows only
   one of them). The prompt shows sizes, and content longer than its preview as head and tail with
   what is omitted. Output is limited only by a per-request cap (a resource that exceeds it fails,
   telling the agent to narrow the request); request payloads are capped too (§3).
 - `view` opens the content in the review pager, from a privileged-owned temp file whose
-  extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
-  with the review editor. Both are argv lists in the configuration (`[review]`, §8), run without a
-  shell, with the file's path appended as the last argument, and with the same fixed environment
-  as resources (§8) plus `TERM` and `COLORTERM`: variables exported where `serve` started (`LESS`,
+  extension comes from the resource's `input_ext` / `output_ext` (§8). `edit`, for outputs, does
+  the same with the review editor. Both are argv lists in the configuration (`[review]`, §8), run
+  without a shell, with the file's path appended as the last argument, and with the fixed
+  environment (§8) plus `TERM` and `COLORTERM`: variables exported where `serve` started (`LESS`,
   `LESSOPEN`, `VIMINIT`) can't change how they treat the content. The defaults work out of the
   box and are safe as they are:
   - pager: `less -+r -+R --no-lessopen`: raw control characters off, input preprocessor disabled.
@@ -484,12 +521,14 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
 ### Running requests
 
 `r` at any prompt lists the running requests, with what helps decide whether one is stuck: time
-running, output size so far, and the last line of its stderr. Selecting one offers:
+running, output size so far, time since it last wrote anything, and the last line of its stderr.
+(Many tools buffer their output when it isn't a terminal, so a long silence is a hint, not
+proof.) Selecting one offers:
 
 ```
 running:
-  1 [k7f2qa01ab] prod-db-ro · 4m12s · 0 B out · stderr: (none)
-  2 [9dq2vtx0mm] aws-readonly · 38s · 1.2 MB out · stderr: Retrying (3/5)...
+  1 [k7f2qa01ab] prod-db-ro · 4m12s · 0 B out · silent 4m12s · stderr: (none)
+  2 [9dq2vtx0mm] aws-readonly · 38s · 1.2 MB out · silent 2s · stderr: Retrying (3/5)...
 which? 1
 [k7f2qa01ab] [o]utput [e]rrors [k]ill(+msg) [b]ack
 ```
@@ -527,10 +566,10 @@ The same rule applies to checkers (§10): external executables, not in-process p
 `~/.penyero/config.toml` (privileged-owned, mode 0600). Everything that defines the human's
 privileged capabilities lives under `~/.penyero` (mode 0700): the configuration, the resource
 executables by convention, and the audit logs (§9). One tree to protect, inspect and back up, as
-with `~/.ssh`. The broker refuses to start if the config file or any resource's `run`
-executable, or any directory above either of them up to the home directory, is group- or
-world-writable or not owned by the privileged user: a writable directory would let someone swap
-the file. A leading `~/` (or a bare `~`) is replaced with the home directory, by the broker when
+with `~/.ssh`. The broker refuses to start if the config file or any resource's executable (the
+first element of its `run`), or any directory above either of them up to the home directory, is
+group- or world-writable or not owned by the privileged user: a writable directory would let
+someone swap the file. Links are resolved first, so the check is on the real files. A leading `~/` (or a bare `~`) is replaced with the home directory, by the broker when
 it loads the file, in every path and every element of an argv list; nothing else is expanded, since
 no shell is involved.
 
@@ -539,39 +578,40 @@ confirmation). Guests are not in the file: a guest is an instance of a profile, 
 deployment and named when the broker starts (`penyero serve <profile> <name>`).
 
 ```toml
+notify = "bell"            # when the pane gets a prompt (§7)
+
 [review]                   # the pager and editor for `view` and `edit` (§7)
 pager = ["less", "-+r", "-+R", "--no-lessopen"]
 editor = ["nvim", "--clean", "-u", "~/.penyero/review.lua"]
 
 [resources.prod-db-ro]
 description = "Production Postgres (read-only role). Bound queries on large tables by time."
-run = "~/.penyero/resources/prod-db-ro"
+run = ["~/.penyero/resources/pg", "prod-ro"]   # one executable, the credential named here
 input = "stdin"            # takes a payload: the SQL
-input_syntax = "sql"
-output_syntax = "csv"
+input_ext = "sql"
+output_ext = "csv"
 
 [resources.prod-db-rw]
 description = "Production Postgres (read-write role)."
-run = "~/.penyero/resources/prod-db-rw"
+run = ["~/.penyero/resources/pg", "prod-rw"]
 input = "stdin"
-input_syntax = "sql"
-output_syntax = "csv"
+input_ext = "sql"
+output_ext = "csv"
 write_credential = true
 
 [resources.aws-readonly]
 description = "AWS CLI with the read-only role. Pass the aws arguments after --."
-run = "~/.penyero/resources/aws-readonly"
+run = ["~/.penyero/resources/aws-readonly"]
 args = true
-output_syntax = "json"
+output_ext = "json"
 
 [resources.ask-human]
 description = "A task for the human: a dashboard query, a value off a console, a question. Payload: the task."
-run = "~/.penyero/resources/ask-human"   # echoes the task back (§8, human resources)
+run = ["~/.penyero/resources/ask-human"]   # echoes the task back (§8, human resources)
 input = "stdin"
 
 [profiles.trusted]
 guest_exec = ["docker", "--context", "colima-cayo", "exec", "-i", "cayo-{profile}-{name}"]
-notify = "bell"
 [profiles.trusted.resources]
 prod-db-ro = { confirm_request = false, confirm_output = false }
 prod-db-rw = {}
@@ -580,7 +620,6 @@ ask-human = {}
 
 [profiles.public]
 guest_exec = ["docker", "--context", "colima-cayo", "exec", "-i", "cayo-{profile}-{name}"]
-notify = "bell"
 [profiles.public.resources]
 prod-db-ro = {}            # every request and every output is confirmed
 aws-readonly = {}
@@ -596,18 +635,29 @@ holds that profile's settings for it. `confirm_request` and `confirm_output` def
 The broker validates at start:
 
 - `confirm_request = false` is only allowed for resources without `write_credential`. Otherwise
-  writes would run unapproved. Releasing output unreviewed is a confidentiality choice and is
-  allowed for any resource.
+  writes would run unapproved. This is the integrity rule (§3) held by the broker, not by the
+  memory of whoever edits a profile months later. Releasing output unreviewed is a
+  confidentiality choice and is allowed for any resource.
 - A profile entry for a resource that does not exist is an error.
-- `guest_exec` must contain `{name}` (and may contain `{profile}`), so that two guests of one
-  profile cannot resolve to the same command.
+- `guest_exec` must contain both `{profile}` and `{name}`. With the name, two guests of one
+  profile cannot resolve to the same command. With the profile, a broker started for the wrong
+  profile finds no guest: penyero can't check what a guest really is (§4, item 5), but the
+  deployment names guests by profile, so `serve trusted shop` can't reach the `public` guest
+  `shop` and hand it `trusted`'s resources. The template should keep the two apart, so that no
+  two pairs give the same command (the reference deployment allows no `-` in names).
+
+### General settings
+
+| Field | Meaning |
+|---|---|
+| `notify` | `"bell"`, `"none"`, or an argv list, run when the pane goes from idle to having a prompt (§7). Default `"bell"`. It describes the human's terminal, so it is one setting, not one per profile |
+| `[review]` | `pager` and `editor`, argv lists (§7) |
 
 ### Profile fields
 
 | Field | Meaning |
 |---|---|
 | `guest_exec` | The command that runs a program inside a guest (§4, item 2), as an argv list with `{profile}` and `{name}` substituted; penyero appends its own program name and arguments. Required for a profile with resources |
-| `notify` | `"bell"`, `"none"`, or an argv list, run when the pane goes from idle to having a prompt (§7). Default `"bell"` |
 | `resources.<resource>` | Makes the resource available to guests of this profile. Keys: `confirm_request` (approve before running), `confirm_output` (approve before releasing the output); both default `true` |
 
 Whether to trust a resource unattended is a property of the profile, not of the resource, which
@@ -618,13 +668,12 @@ is why the confirmation settings live here.
 | Field | Meaning |
 |---|---|
 | `description` | Shown to the agent by `list`/`describe` and to the human in the prompt |
-| `run` | The privileged-owned executable |
+| `run` | An argv list: the privileged-owned executable and any fixed arguments, such as the name of the credential to use, so one executable can serve several resources. The agent can't change them; its own arguments follow them |
 | `input` | `"stdin"` if the resource takes a payload. Omitted: no payload accepted |
-| `args` | `true` if extra arguments after `--` are passed as argv. Default `false` |
-| `params` | Table of named parameters and their descriptions. Undeclared parameters are rejected |
-| `input_syntax`, `output_syntax` | Review hints: the file extension used for `view`/`edit` |
-| `write_credential` | `true` if the resource's credential can change state. Default `false`. The human's declaration of what the credential enforces |
-| `concurrency` | How many of its requests may run at once, per guest. Default `1`. Approved requests beyond it wait for a free slot. It bounds the load on the service and keeps serial resources serial; it is not an ordering guarantee (§6) |
+| `args` | `true` if the agent's extra arguments after `--` are passed as argv, after `run`'s own. Default `false` |
+| `input_ext`, `output_ext` | The file extension of the temp file `view` and `edit` open, which is how the pager and editor pick a syntax |
+| `write_credential` | `true` if the resource's credential can change state. Default `false`. The human's declaration of what the credential enforces: such a resource is never auto-approved (above) and is marked as a write in its prompts (§7) |
+| `concurrency` | How many of its requests may run at once, per guest: a broker knows only its own guest. Default `1`. Approved requests beyond it wait for a free slot. It bounds what one guest can ask of the service; a limit across guests belongs to the service (a connection limit) or to the executable (a lock file). It is not an ordering guarantee (§6) |
 | `timeout` | Seconds a request may run before the broker stops it. Default `300`: long enough for a slow query, short enough to bound a broken setup. Only execution counts, not waiting for approval or a slot. A stopped request fails with the output it wrote so far (§6, exit 1) |
 
 ### The resource contract
@@ -634,8 +683,8 @@ A resource has one audience on each side, and the broker keeps them apart:
 - **stdout is for the agent.** Whatever the resource writes there is the result, released to the
   guest after review (or at once, if the profile says so).
 - **stderr is for the human.** Diagnostics, the wrapped tool's own errors, anything that mentions
-  hosts, users or paths. Its tail is shown in the approval pane and all of it on request (§7), it
-  is written to the audit log, and it is never sent to the guest.
+  hosts, users or paths. Its tail is shown in the approval pane and all of it on request (§7), its
+  tail is written to the audit log, and it is never sent to the guest.
 - **Exit 0 is success; any other status is failure.** The status itself is not forwarded. A
   resource that wants the agent to know *why* it failed writes that to stdout before exiting
   ("syntax error at line 3"), and leaves out what the agent has no business knowing ("connection
@@ -647,18 +696,21 @@ directly. They may be shared, and penyero may ship some, but each one is the hum
 ### Resource executables
 
 A resource is an executable owned by the privileged user. It is executed directly (never
-through `sh -c`). It receives the payload on stdin, declared parameters as `PENYERO_P_<NAME>`
-environment variables, and, if `args = true`, the extra arguments as argv. The agent cannot set
-any other part of its environment. It fetches its own secrets with whatever the OS provides (macOS
-`security`, Linux `secret-tool`, `pass`, `op read`, ...).
+through `sh -c`), as its `run` list. It receives the payload on stdin and, if `args = true`, the
+agent's extra arguments appended to that list. The agent sets nothing else: no option of the
+executable's own unless it passes them on, and no part of its environment. It fetches its own
+secrets with whatever the OS provides (macOS `security`, Linux `secret-tool`, `pass`, `op read`,
+...). One way in for the agent's words keeps the executable simple to review: one that wants
+named inputs parses them from its arguments.
 
-**The environment is fixed, not inherited.** A resource gets `PATH`, `HOME`, `USER`, the locale
-variables and its `PENYERO_P_*` parameters, and nothing else from the shell that started
-`serve`. Many tools let the environment choose their credential and configuration (for the AWS
-CLI, variables like `AWS_ACCESS_KEY_ID` override its credentials file; libpq reads `PG*`
-variables), so an admin key exported there for some unrelated task would otherwise reach every
-resource, and a read-only one that auto-approves would silently run with it. A resource that
-needs more (an agent socket, a tool's own variables) sets it itself.
+**The environment is fixed, not inherited.** Everything the broker starts (resources, the review
+pager and editor, `guest_exec`, a `notify` command) gets `PATH`, `HOME`, `USER` and the locale
+variables, and nothing else from the shell that started `serve`. Many tools let the environment
+choose their credential and configuration (for the AWS CLI, variables like `AWS_ACCESS_KEY_ID`
+override its credentials file; libpq reads `PG*` variables), so an admin key exported there for
+some unrelated task would otherwise reach every resource, and a read-only one that auto-approves
+would silently run with it. A resource that needs more (an agent socket, a tool's own variables)
+sets it itself.
 
 Resource executables must reference only privileged-owned files. A script taken from a project
 (for example a repo's `bin/console`) is used from a privileged clean clone at a reviewed
@@ -666,9 +718,9 @@ commit (§3, the exception to the core rule), never from the AI workspace.
 
 ### Resources run agent input on the privileged side
 
-A resource runs on the privileged side, and its payload, parameters and arguments are written by
-the agent. So the executable is exactly the kind of program the core rule (§3) is about, and it
-must hold three properties. These protect the host and the credential itself; they don't classify
+A resource runs on the privileged side, and its payload and arguments are written by the agent.
+So the executable is exactly the kind of program the core rule (§3) is about, and it must hold
+three properties. These protect the host and the credential itself; they don't classify
 requests as reads or writes, so they don't conflict with §5.
 
 1. **Nothing in the input runs on the host or touches its files.** Many clients interpret part of
@@ -708,9 +760,16 @@ earlier in the same request would lift the timeout. The load is that timeout tim
 running at once: bound those with the resource's `concurrency`, which counts per guest, and
 across guests with a connection limit on the role.
 
-An auto-approved resource with `args = true` exposes everything its credential can read (§5,
-condition 2): a read-only cloud role can often read parameters, secrets stores and object storage.
-Narrow the credential, or the subcommands the executable allows, before auto-approving it.
+**Read-only is not harmless to auto-approve either.** With `args = true` the agent chooses the
+operation, and with auto-approval nobody looks at the choice. So the agent can read anything the
+credential can (§5, condition 2), and a read-only cloud role can often read decrypted
+parameters, secrets stores and the contents of object storage. Narrow the credential, or the
+operations the executable allows, before auto-approving it.
+
+Write these executables in a language with real argument parsing and no shell between the input
+and the tool. Their risk is not memory safety but what the wrapped tool makes of its input, and
+shell patterns are easy to get subtly wrong (a pattern that blocks `--endpoint-url` misses
+`--endpoint`, which the AWS CLI accepts as an abbreviation).
 
 ### Human resources
 
@@ -733,22 +792,33 @@ Each approved snippet runs in the same live session and returns its output.
 
 penyero doesn't hold sessions. A separate **session holder** keeps the process alive, in its
 own terminal where the human completes any interactive authentication, and a resource executable
-sends it each approved snippet and returns the output. The resource's `concurrency = 1` keeps
-the session serial. A holder may ship with penyero as a separate tool (§10). The same three
-properties apply: a local psql session would have to be confined, while a remote console runs its
-input remotely. Until a holder exists, the same work is done with repeated requests (each query
-is one request), which is slower but simple and safe.
+sends it each approved snippet and returns the output. The holder runs one snippet at a time and
+queues the rest itself: the resource's `concurrency` counts per guest, so it can't keep a session
+that several guests use serial. A holder may ship with penyero as a separate tool (§10). The
+same three properties apply: a local psql session would have to be confined, while a remote
+console runs its input remotely. Until a holder exists, the same work is done with repeated
+requests (each query is one request), which is slower but simple and safe.
 
 ## 9. Audit log
 
 Every request is recorded on the privileged side, one log per guest (`profile/name`), with each
 broker run marked so that a guest recreated under the same name stays distinguishable. Entries
-carry: request id, reason, the request as submitted and as run (if edited), decisions,
-timestamps, exit status, the resource's stderr, output size and a hash of the output, and the
-original output when the released one was changed. Output bodies are not logged otherwise.
-Each step of a request (received, decided, started, finished, stopped or killed, released,
-retrieved, cancelled, dropped) is recorded as it happens, so a crash leaves a record of how far
-every request got.
+carry: request id, reason, the request in full, decisions, timestamps, exit status, the tail of
+the resource's stderr, and the size and a hash of the output: of what the resource wrote and,
+when the human changed it, of what was released too. Each step of a request (received, decided,
+started, finished, stopped or killed, released, retrieved, cancelled, dropped) is recorded as it
+happens, so a crash leaves a record of how far every request got.
+
+- **Requests are logged whole, outputs never.** The request is the audit: what was done to a
+  privileged system, on whose approval. An output is production data, and a log that kept it
+  would be a second, long-lived copy of whatever was read, in a file that gets backed up. That
+  holds most of all for an output the human redacted: the original is exactly what was judged
+  too sensitive to pass on. The hashes tell whether an output was changed and let a kept copy be
+  matched; they don't bring it back.
+- **The log is hostile content at rest.** Requests and stderr in it were written or influenced by
+  the agent. Its encoding keeps every non-ASCII and control character escaped, so printing the
+  file is safe; a tool that decodes a field (`jq -r`) puts the raw text on the terminal. Read
+  fields through the review pager.
 
 ## 10. Backlog
 
@@ -766,7 +836,7 @@ document may still change, `1.0` when they stop.
 3. **A session holder** (§8): a separate tool that keeps an interactive process alive and runs
    the snippets a resource executable sends it, outside the broker.
 4. **Review formatting**: formatters for the inline prompt that only insert whitespace and
-   colour (pattern-based, per `input_syntax`/`output_syntax`) and never rebuild the content, so
+   colour (pattern-based, per `input_ext`/`output_ext`) and never rebuild the content, so
    what is shown is still exactly what is approved (§7). To be designed when picked; one option
    is an external formatter whose output the broker checks equals the input up to whitespace.
 5. **An MCP client as a resource executable.** Some integrations exist only as MCP servers. A
@@ -782,6 +852,13 @@ document may still change, `1.0` when they stop.
 8. **Egress approval**: the deployment's egress proxy asks penyero before allowing a new host,
    so the human approves domains the way they approve requests. It needs a way for the proxy to
    reach the broker, which listens on nothing today.
+9. **A full-screen front end** for the approval pane (§7): the queue, the running requests and
+   the content in view at once, with the standard library's `curses`. Same interaction, same
+   rendering rule (escaped plain text, wrapped, nothing clipped unmarked); the line-oriented one
+   stays, for tests and for scripting. To be decided after the core has been used for real.
+10. **Editing a request before approving it.** Left out of the core: deny with a message does the
+    same at the cost of one round trip. It would bring back a notice to the agent that what ran
+    is not what it sent, both versions in the log, and a format for editing arguments.
 
 ## 11. Open questions
 
